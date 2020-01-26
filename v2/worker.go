@@ -5,17 +5,19 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"reflect"
 	"syscall"
 	"time"
 
-	"github.com/opentracing/opentracing-go"
+	tasksv1 "github.com/RichardKnop/machinery/v1/tasks"
 
-	"github.com/RichardKnop/machinery/v1/backends/amqp"
 	"github.com/RichardKnop/machinery/v1/brokers/errs"
 	"github.com/RichardKnop/machinery/v1/log"
 	"github.com/RichardKnop/machinery/v1/retry"
-	"github.com/RichardKnop/machinery/v1/tasks"
-	"github.com/RichardKnop/machinery/v1/tracing"
+	tracingv1 "github.com/RichardKnop/machinery/v1/tracing"
+	"github.com/RichardKnop/machinery/v2/tasks"
+	"github.com/RichardKnop/machinery/v2/tracing"
+	"github.com/opentracing/opentracing-go"
 )
 
 // Worker represents a single worker process
@@ -118,28 +120,96 @@ func (worker *Worker) Quit() {
 	worker.server.GetBroker().StopConsuming()
 }
 
+// TODO: Log errors
+func (worker *Worker) convertDecodeSignature(sig *tasks.DecodeSignature) (*tasks.Signature, error) {
+	if sig == nil {
+		return nil, nil
+	}
+
+	taskFunc, err := worker.server.GetRegisteredTask(sig.Name)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get registered task: %w", err)
+	}
+
+	args, err := tasks.DecodeArgs(reflect.ValueOf(taskFunc), sig.Args)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode task args: %w", err)
+	}
+
+	onSuccess := make([]*tasks.Signature, 0, len(sig.OnSuccess))
+	for _, s := range sig.OnSuccess {
+		cs, err := worker.convertDecodeSignature(s)
+		if err != nil {
+			return nil, err
+		}
+		onSuccess = append(onSuccess, cs)
+	}
+	onError := make([]*tasks.Signature, 0, len(sig.OnError))
+	for _, s := range sig.OnError {
+		cs, err := worker.convertDecodeSignature(s)
+		if err != nil {
+			return nil, err
+		}
+		onError = append(onError, cs)
+	}
+
+	ccb, err := worker.convertDecodeSignature(sig.ChordCallback)
+	if err != nil {
+		return nil, err
+	}
+
+	return &tasks.Signature{
+		Signature: tasksv1.Signature{
+			UUID:                        sig.UUID,
+			Name:                        sig.Name,
+			RoutingKey:                  sig.RoutingKey,
+			ETA:                         sig.ETA,
+			GroupUUID:                   sig.GroupUUID,
+			GroupTaskCount:              sig.GroupTaskCount,
+			Headers:                     sig.Headers,
+			Priority:                    sig.Priority,
+			Immutable:                   sig.Immutable,
+			RetryCount:                  sig.RetryCount,
+			RetryTimeout:                sig.RetryTimeout,
+			BrokerMessageGroupId:        sig.BrokerMessageGroupId,
+			SQSReceiptHandle:            sig.SQSReceiptHandle,
+			StopTaskDeletionOnError:     sig.StopTaskDeletionOnError,
+			IgnoreWhenTaskNotRegistered: sig.IgnoreWhenTaskNotRegistered,
+		},
+		Args:          args,
+		OnSuccess:     onSuccess,
+		OnError:       onError,
+		ChordCallback: ccb,
+	}, nil
+}
+
 // Process handles received tasks and triggers success/error callbacks
-func (worker *Worker) Process(signature *tasks.Signature) error {
+func (worker *Worker) Process(decodeSignature *tasks.DecodeSignature) error {
 	// If the task is not registered with this worker, do not continue
 	// but only return nil as we do not want to restart the worker process
-	if !worker.server.IsTaskRegistered(signature.Name) {
+	if !worker.server.IsTaskRegistered(decodeSignature.Name) {
 		return nil
 	}
 
-	taskFunc, err := worker.server.GetRegisteredTask(signature.Name)
+	taskFunc, err := worker.server.GetRegisteredTask(decodeSignature.Name)
 	if err != nil {
 		return nil
 	}
 
+	signature, err := worker.convertDecodeSignature(decodeSignature)
+	if err != nil {
+		return fmt.Errorf("failed to decode task: %w", err)
+	}
+
 	// Update task state to RECEIVED
 	if err = worker.server.GetBackend().SetStateReceived(signature); err != nil {
-		return fmt.Errorf("Set state to 'received' for task %s returned error: %s", signature.UUID, err)
+		return fmt.Errorf("Set state to 'received' for task %s returned error: %s", decodeSignature.UUID, err)
 	}
 
 	// Prepare task for processing
 	task, err := tasks.NewWithSignature(taskFunc, signature)
 	// if this failed, it means the task is malformed, probably has invalid
-	// signature, go directly to task failed without checking whether to retry
+	// decodeSignature, go directly to task failed without checking whether to retry
 	if err != nil {
 		worker.taskFailed(signature, err)
 		return err
@@ -148,13 +218,13 @@ func (worker *Worker) Process(signature *tasks.Signature) error {
 	// try to extract trace span from headers and add it to the function context
 	// so it can be used inside the function if it has context.Context as the first
 	// argument. Start a new span if it isn't found.
-	taskSpan := tracing.StartSpanFromHeaders(signature.Headers, signature.Name)
+	taskSpan := tracingv1.StartSpanFromHeaders(decodeSignature.Headers, decodeSignature.Name)
 	tracing.AnnotateSpanWithSignatureInfo(taskSpan, signature)
 	task.Context = opentracing.ContextWithSpan(task.Context, taskSpan)
 
 	// Update task state to STARTED
 	if err = worker.server.GetBackend().SetStateStarted(signature); err != nil {
-		return fmt.Errorf("Set state to 'started' for task %s returned error: %s", signature.UUID, err)
+		return fmt.Errorf("Set state to 'started' for task %s returned error: %s", decodeSignature.UUID, err)
 	}
 
 	//Run handler before the task is called
@@ -172,21 +242,26 @@ func (worker *Worker) Process(signature *tasks.Signature) error {
 	if err != nil {
 		// If a tasks.ErrRetryTaskLater was returned from the task,
 		// retry the task after specified duration
-		retriableErr, ok := interface{}(err).(tasks.ErrRetryTaskLater)
+		retriableErr, ok := interface{}(err).(tasksv1.ErrRetryTaskLater)
 		if ok {
 			return worker.retryTaskIn(signature, retriableErr.RetryIn())
 		}
 
-		// Otherwise, execute default retry logic based on signature.RetryCount
-		// and signature.RetryTimeout values
-		if signature.RetryCount > 0 {
+		// Otherwise, execute default retry logic based on decodeSignature.RetryCount
+		// and decodeSignature.RetryTimeout values
+		if decodeSignature.RetryCount > 0 {
 			return worker.taskRetry(signature)
 		}
 
 		return worker.taskFailed(signature, err)
 	}
 
-	return worker.taskSucceeded(signature, results)
+	res := make([]interface{}, 0, len(results))
+	for _, r := range results {
+		res = append(res, r.Value)
+	}
+
+	return worker.taskSucceeded(signature, res)
 }
 
 // retryTask decrements RetryCount counter and republishes the task to the queue
@@ -233,21 +308,14 @@ func (worker *Worker) retryTaskIn(signature *tasks.Signature, retryIn time.Durat
 
 // taskSucceeded updates the task state and triggers success callbacks or a
 // chord callback if this was the last task of a group with a chord callback
-func (worker *Worker) taskSucceeded(signature *tasks.Signature, taskResults []*tasks.TaskResult) error {
+func (worker *Worker) taskSucceeded(signature *tasks.Signature, taskResults []interface{}) error {
 	// Update task state to SUCCESS
 	if err := worker.server.GetBackend().SetStateSuccess(signature, taskResults); err != nil {
 		return fmt.Errorf("Set state to 'success' for task %s returned error: %s", signature.UUID, err)
 	}
 
 	// Log human readable results of the processed task
-	var debugResults = "[]"
-	results, err := tasks.ReflectTaskResults(taskResults)
-	if err != nil {
-		log.WARNING.Print(err)
-	} else {
-		debugResults = tasks.HumanReadableResults(results)
-	}
-	log.DEBUG.Printf("Processed task %s. Results = %s", signature.UUID, debugResults)
+	log.DEBUG.Printf("Processed task %s. Results = %+v", signature.UUID, taskResults)
 
 	// Trigger success callbacks
 
@@ -255,10 +323,7 @@ func (worker *Worker) taskSucceeded(signature *tasks.Signature, taskResults []*t
 		if signature.Immutable == false {
 			// Pass results of the task to success callbacks
 			for _, taskResult := range taskResults {
-				successTask.Args = append(successTask.Args, tasks.Arg{
-					Type:  taskResult.Type,
-					Value: taskResult.Value,
-				})
+				successTask.Args = append(successTask.Args, taskResult)
 			}
 		}
 
@@ -323,10 +388,7 @@ func (worker *Worker) taskSucceeded(signature *tasks.Signature, taskResults []*t
 		if signature.ChordCallback.Immutable == false {
 			// Pass results of the task to the chord callback
 			for _, taskResult := range taskState.Results {
-				signature.ChordCallback.Args = append(signature.ChordCallback.Args, tasks.Arg{
-					Type:  taskResult.Type,
-					Value: taskResult.Value,
-				})
+				signature.ChordCallback.Args = append(signature.ChordCallback.Args, taskResult)
 			}
 		}
 	}
@@ -356,10 +418,7 @@ func (worker *Worker) taskFailed(signature *tasks.Signature, taskErr error) erro
 	// Trigger error callbacks
 	for _, errorTask := range signature.OnError {
 		// Pass error as a first argument to error callbacks
-		args := append([]tasks.Arg{{
-			Type:  "string",
-			Value: taskErr.Error(),
-		}}, errorTask.Args...)
+		args := append([]interface{}{taskErr.Error()}, errorTask.Args...)
 		errorTask.Args = args
 		worker.server.SendTask(errorTask)
 	}
@@ -372,9 +431,11 @@ func (worker *Worker) taskFailed(signature *tasks.Signature, taskErr error) erro
 }
 
 // Returns true if the worker uses AMQP backend
+// TODO: Implement v2 amqp backend
 func (worker *Worker) hasAMQPBackend() bool {
-	_, ok := worker.server.GetBackend().(*amqp.Backend)
-	return ok
+	//_, ok := worker.server.GetBackend().(*amqp.Backend)
+	//return ok
+	return false
 }
 
 // SetErrorHandler sets a custom error handler for task errors

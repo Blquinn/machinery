@@ -6,15 +6,15 @@ import (
 	"fmt"
 	"sync"
 
+	"github.com/RichardKnop/machinery/v1/config"
+	tracingv1 "github.com/RichardKnop/machinery/v1/tracing"
+	backendsiface "github.com/RichardKnop/machinery/v2/backends/iface"
+	"github.com/RichardKnop/machinery/v2/backends/result"
+	brokersiface "github.com/RichardKnop/machinery/v2/brokers/iface"
+	"github.com/RichardKnop/machinery/v2/tasks"
+	"github.com/RichardKnop/machinery/v2/tracing"
 	"github.com/google/uuid"
 	"github.com/opentracing/opentracing-go"
-
-	backendsiface "github.com/RichardKnop/machinery/v1/backends/iface"
-	"github.com/RichardKnop/machinery/v1/backends/result"
-	brokersiface "github.com/RichardKnop/machinery/v1/brokers/iface"
-	"github.com/RichardKnop/machinery/v1/config"
-	"github.com/RichardKnop/machinery/v1/tasks"
-	"github.com/RichardKnop/machinery/v1/tracing"
 )
 
 // Server is the main Machinery object and stores all configuration
@@ -131,7 +131,7 @@ func (server *Server) GetRegisteredTask(name string) (interface{}, error) {
 
 // SendTaskWithContext will inject the trace context in the signature headers before publishing it
 func (server *Server) SendTaskWithContext(ctx context.Context, signature *tasks.Signature) (*result.AsyncResult, error) {
-	span, _ := opentracing.StartSpanFromContext(ctx, "SendTask", tracing.ProducerOption(), tracing.MachineryTag)
+	span, _ := opentracing.StartSpanFromContext(ctx, "SendTask", tracingv1.ProducerOption(), tracingv1.MachineryTag)
 	defer span.Finish()
 
 	// tag the span with some info about the signature
@@ -171,7 +171,7 @@ func (server *Server) SendTask(signature *tasks.Signature) (*result.AsyncResult,
 
 // SendChainWithContext will inject the trace context in all the signature headers before publishing it
 func (server *Server) SendChainWithContext(ctx context.Context, chain *tasks.Chain) (*result.ChainAsyncResult, error) {
-	span, _ := opentracing.StartSpanFromContext(ctx, "SendChain", tracing.ProducerOption(), tracing.MachineryTag, tracing.WorkflowChainTag)
+	span, _ := opentracing.StartSpanFromContext(ctx, "SendChain", tracingv1.ProducerOption(), tracingv1.MachineryTag, tracingv1.WorkflowChainTag)
 	defer span.Finish()
 
 	tracing.AnnotateSpanWithChainInfo(span, chain)
@@ -191,7 +191,7 @@ func (server *Server) SendChain(chain *tasks.Chain) (*result.ChainAsyncResult, e
 
 // SendGroupWithContext will inject the trace context in all the signature headers before publishing it
 func (server *Server) SendGroupWithContext(ctx context.Context, group *tasks.Group, sendConcurrency int) ([]*result.AsyncResult, error) {
-	span, _ := opentracing.StartSpanFromContext(ctx, "SendGroup", tracing.ProducerOption(), tracing.MachineryTag, tracing.WorkflowGroupTag)
+	span, _ := opentracing.StartSpanFromContext(ctx, "SendGroup", tracingv1.ProducerOption(), tracingv1.MachineryTag, tracingv1.WorkflowGroupTag)
 	defer span.Finish()
 
 	tracing.AnnotateSpanWithGroupInfo(span, group, sendConcurrency)
@@ -272,7 +272,7 @@ func (server *Server) SendGroup(group *tasks.Group, sendConcurrency int) ([]*res
 
 // SendChordWithContext will inject the trace context in all the signature headers before publishing it
 func (server *Server) SendChordWithContext(ctx context.Context, chord *tasks.Chord, sendConcurrency int) (*result.ChordAsyncResult, error) {
-	span, _ := opentracing.StartSpanFromContext(ctx, "SendChord", tracing.ProducerOption(), tracing.MachineryTag, tracing.WorkflowChordTag)
+	span, _ := opentracing.StartSpanFromContext(ctx, "SendChord", tracingv1.ProducerOption(), tracingv1.MachineryTag, tracingv1.WorkflowChordTag)
 	defer span.Finish()
 
 	tracing.AnnotateSpanWithChordInfo(span, chord, sendConcurrency)
