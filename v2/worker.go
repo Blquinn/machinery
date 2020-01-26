@@ -120,6 +120,9 @@ func (worker *Worker) Quit() {
 	worker.server.GetBroker().StopConsuming()
 }
 
+// convertDecodeSignature converts a DecodeSignature and all of it's sub-signatures into
+// Signatures. It needs a reference to the server (via the worker) to get the type information
+// of the signature's task function.
 // TODO: Log errors
 func (worker *Worker) convertDecodeSignature(sig *tasks.DecodeSignature) (*tasks.Signature, error) {
 	if sig == nil {
@@ -184,6 +187,7 @@ func (worker *Worker) convertDecodeSignature(sig *tasks.DecodeSignature) (*tasks
 }
 
 // Process handles received tasks and triggers success/error callbacks
+// TODO: This needs logging...
 func (worker *Worker) Process(decodeSignature *tasks.DecodeSignature) error {
 	// If the task is not registered with this worker, do not continue
 	// but only return nil as we do not want to restart the worker process

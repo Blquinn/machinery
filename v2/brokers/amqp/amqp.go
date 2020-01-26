@@ -313,26 +313,25 @@ func (b *Broker) consumeOne(delivery amqp.Delivery, taskProcessor iface.TaskProc
 		return errors.New("Received an empty message") // RabbitMQ down?
 	}
 
-	var multiple, requeue = false, false
-
 	// Unmarshal message body into signature struct
 	signature := new(tasks.DecodeSignature)
 	decoder := json.NewDecoder(bytes.NewReader(delivery.Body))
 	decoder.UseNumber()
 	if err := decoder.Decode(signature); err != nil {
-		delivery.Nack(multiple, requeue)
+		delivery.Nack(false, false)
 		return errs.NewErrCouldNotUnmarshaTaskSignature(delivery.Body, err)
 	}
 
 	// If the task is not registered, we nack it and requeue,
 	// there might be different workers for processing specific tasks
 	if !b.IsTaskRegistered(signature.Name) {
+		requeue := false
 		if !delivery.Redelivered {
 			requeue = true
 			log.INFO.Printf("Task not registered with this worker. Requeing message: %s", delivery.Body)
 		}
 		if !signature.IgnoreWhenTaskNotRegistered {
-			delivery.Nack(multiple, requeue)
+			delivery.Nack(false, requeue)
 		}
 		return nil
 	}
@@ -340,7 +339,7 @@ func (b *Broker) consumeOne(delivery amqp.Delivery, taskProcessor iface.TaskProc
 	log.DEBUG.Printf("Received new message: %s", delivery.Body)
 
 	err := taskProcessor.Process(signature)
-	delivery.Ack(multiple)
+	delivery.Ack(false)
 	return err
 }
 
